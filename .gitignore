@@ -1,0 +1,6 @@
+# Binaries must not be committed (per assignment instructions)
+minivm-takehome/bin/
+minivm-onepager.pdf
+__pycache__/
+*.pyc
+minivm-takehome/.DS_Store
