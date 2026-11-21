@@ -38,7 +38,6 @@ from decimal import Decimal
 KEYWORDS = {"NULL", "TRUE", "FALSE", "ASC", "DESC", "NF", "NL", "NULLEQ"}
 REG_RE = re.compile(r"^[A-Za-z_]\w*$")
 SORTKEY_RE = re.compile(r"^([A-Za-z_]\w*)(\s+(?:ASC|DESC)\s+(?:NF|NL))$", re.IGNORECASE)
-TABLECOL_RE = re.compile(r"^[A-Za-z_]\w*\.[A-Za-z_]\w*$")
 INT_LIT_RE = re.compile(r"^-?\d+$")
 NUM_LIT_RE = re.compile(r"^-?\d+\.\d+$")
 
