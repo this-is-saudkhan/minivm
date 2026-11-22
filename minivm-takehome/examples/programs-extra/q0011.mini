@@ -1,0 +1,29 @@
+; For each region, how many *other* regions exist (a trivial cross-check
+; the legacy author implemented as a self-join), region code and name, by
+; code. There are only 4 regions -- small enough that a nested-loop join is
+; cheaper than a hash join, but the legacy plan always used HJOIN regardless
+; of table size.
+; Exercises: HJOIN on a tiny table (demonstrates optimize's HJOIN<->NLJOIN
+; algorithm-choice pass actually swapping it to NLJOIN: 4x4=16 vs 6x(4+4)=48
+; estimated cycles), FILL (a constant join key for a true cross join), and
+; NE/IDX/GROUP/GCOUNT.
+LOAD r_code, regions.r_code
+LOAD r_name, regions.r_name
+FILL k, 0, r_code                   ; every row joins every row (cross join)
+HJOIN li, ri, k, k
+GATHER lid, r_code, li
+GATHER rid, r_code, ri
+NE diff, lid, rid
+IDX w, diff
+GATHER keep, li, w
+GROUP g, keep
+GCOUNT cnt, g
+GFIRST f, g
+GATHER rep, keep, f
+GATHER rep_code, r_code, rep
+GATHER rep_name, r_name, rep
+SORT s, rep_code ASC NF
+GATHER o_code, rep_code, s
+GATHER o_name, rep_name, s
+GATHER o_cnt, cnt, s
+OUT o_code, o_name, o_cnt

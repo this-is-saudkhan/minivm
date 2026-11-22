@@ -754,6 +754,9 @@ def main():
         bundled_schema = json.load(f)
     bundled_schema_path = os.path.join(HERE, "examples", "schema.json")
     bundled_programs = sorted(glob.glob(os.path.join(HERE, "examples", "programs", "*.mini")))
+    bundled_programs += sorted(
+        glob.glob(os.path.join(HERE, "examples", "programs-extra", "*.mini"))
+    )
     bundled_data = os.path.join(HERE, "examples", "data.json")
 
     scratch = tempfile.mkdtemp(prefix="minivm_eval_")

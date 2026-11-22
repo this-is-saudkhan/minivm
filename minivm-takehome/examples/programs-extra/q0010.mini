@@ -1,0 +1,25 @@
+; The 3 customers with the largest total order amount (ties by customer id),
+; name and total.
+; Exercises: TOPK directly (none of the 8 bundled examples use it -- q0007
+; gets a similar effect via IOTA+SLICE instead), plus GROUP/GFIRST/GSUM and
+; a dead LOAD for DCE to remove.
+LOAD o_id_unused, orders.o_id       ; dead: never read again
+LOAD o_cust, orders.o_cust
+LOAD o_amt, orders.o_amt
+GROUP g, o_cust
+GFIRST f, g
+GATHER cust_id, o_cust, f
+GSUM total, g, o_amt
+TOPK k, 3, total DESC NL, cust_id ASC NF
+GATHER top_cust, cust_id, k
+GATHER top_total, total, k
+LOAD c_id, customers.c_id
+LOAD c_name, customers.c_name
+HJOIN li, ri, top_cust, c_id
+GATHER out_cust, top_cust, li
+GATHER out_total, top_total, li
+GATHER out_name, c_name, ri
+SORT s, out_total DESC NL, out_cust ASC NF
+GATHER r_name, out_name, s
+GATHER r_total, out_total, s
+OUT r_name, r_total
