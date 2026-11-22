@@ -1,5 +1,10 @@
 # MiniVM optimizer/evaluator: design, limitations, and a plan for more time
 
+This is the assignment's required "written plan" deliverable. For the full
+engineering writeup (parameters, decision points, testing strategy, tool
+choices) see `docs/APPROACH.md`; for the 4 added example programs with run
+output and analysis see `docs/EXAMPLES_EXTRA.md`.
+
 ## What's here
 
 - `optimize` — Python 3 (stdlib only). Parses a program, then in one forward
