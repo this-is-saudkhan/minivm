@@ -290,14 +290,15 @@ CMP_OPS = {"GT", "GE", "LT", "LE", "EQ"}
 
 
 def always_true(op, fa, fb):
+    both_not_null = fa.not_null and fb.not_null
     if op == "GT":
-        return fa.lo is not None and fb.hi is not None and fa.lo > fb.hi and fa.not_null and fb.not_null
+        return fa.lo is not None and fb.hi is not None and fa.lo > fb.hi and both_not_null
     if op == "GE":
-        return fa.lo is not None and fb.hi is not None and fa.lo >= fb.hi and fa.not_null and fb.not_null
+        return fa.lo is not None and fb.hi is not None and fa.lo >= fb.hi and both_not_null
     if op == "LT":
-        return fa.hi is not None and fb.lo is not None and fa.hi < fb.lo and fa.not_null and fb.not_null
+        return fa.hi is not None and fb.lo is not None and fa.hi < fb.lo and both_not_null
     if op == "LE":
-        return fa.hi is not None and fb.lo is not None and fa.hi <= fb.lo and fa.not_null and fb.not_null
+        return fa.hi is not None and fb.lo is not None and fa.hi <= fb.lo and both_not_null
     if op == "EQ":
         return (
             fa.lo is not None and fa.lo == fa.hi == fb.lo == fb.hi
@@ -385,7 +386,8 @@ def optimize_program(instrs, schema):
                 reg_class[d] = reg_class.get(alias[d])
                 continue
             cse_cache[key] = (d,)
-            set_dest_plain(d, reg_facts.get(s_can, UNKNOWN_FACTS), uf.find(reg_class.get(i_can)) or fresh_id())
+            i_class = uf.find(reg_class.get(i_can)) or fresh_id()
+            set_dest_plain(d, reg_facts.get(s_can, UNKNOWN_FACTS), i_class)
             kept.append((ins, rendered))
             continue
 

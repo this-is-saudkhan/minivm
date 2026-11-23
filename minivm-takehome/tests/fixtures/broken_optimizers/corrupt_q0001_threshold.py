@@ -10,7 +10,7 @@ import sys
 
 with open(sys.argv[1]) as f:
     lines = f.readlines()
-for i, l in enumerate(lines):
-    if l.strip().upper().startswith("GT") and "750.00" in l:
-        lines[i] = l.replace("750.00", "740.00")
+for i, line in enumerate(lines):
+    if line.strip().upper().startswith("GT") and "750.00" in line:
+        lines[i] = line.replace("750.00", "740.00")
 sys.stdout.write("".join(lines))
