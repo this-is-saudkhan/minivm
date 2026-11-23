@@ -35,6 +35,8 @@ which prints `{"ncols": 1, "rows": [...], "cycles": C}` as one line of JSON; on
 - [Values](values.md): types, NULL, the NUM range, columns and group sets, ordering and comparison.
 - [Running](running.md): program rules and limits, errors, the command line, the table-set JSON format.
 - [Cycles](cycles.md): the cost model: base cost, string bytes, comparison cost, the full cost table.
+- [Approach](APPROACH.md): design of `optimize`/`evaluate`, parameters and decision points, testing strategy, tool/model choices.
+- [Extra examples](EXAMPLES_EXTRA.md): 4 added example programs (q0009–q0012), with run output and analysis.
 - [Instructions](instructions/README.md): conventions shared by all instructions, and an index of every opcode.
   - [Arithmetic](instructions/arithmetic.md): `ADD` `SUB` `MUL` `DIV` `IDIV` `MOD` `NEG` `WRAP` `TRUNC`.
   - [Logic](instructions/logic.md): `EQ` `NE` `LT` `LE` `GT` `GE` `IS` `AND` `OR` `NOT` `ISNULL` `NVL` `IF` `NULLIF` `NULLIFE`.

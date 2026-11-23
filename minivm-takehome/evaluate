@@ -1,3 +1,842 @@
-#!/bin/sh
-# ./evaluate OPTIMIZER  ->  exit 0 if no defects found, non-zero otherwise
-exit 0
+#!/usr/bin/env python3
+"""./evaluate OPTIMIZER -> exit 0 if no defects found, non-zero otherwise.
+
+Tests OPTIMIZER (anything with optimize's interface: `OPTIMIZER program.mini
+schema.json` prints an optimized program) for defects: an optimized program
+whose results differ from the original's, by the rules in the assignment
+(order doesn't matter unless the input program specifies it; NUM values
+must agree within 1e-6 relative; if the ORIGINAL program errors, anything
+goes). Budgeted to finish within ~2 minutes.
+
+Two layers:
+  1. Regression: the 8 bundled examples against examples/data.json.
+  2. Fuzzing: for the bundled schema, and for a handful of small synthetic
+     schemas covering opcodes the bundled examples don't exercise, generate
+     random table sets that satisfy every declared constraint (key,
+     not_null, refs, check, sorted), and compare original vs. optimized
+     results on each.
+
+The optimizer only ever sees (program, schema) -- never the data -- so for
+a given program its optimized output is fixed across every random dataset
+generated from the same schema; it is invoked once per program and cached,
+then exercised against many datasets.
+"""
+import sys
+import os
+import re
+import json
+import random
+import subprocess
+import tempfile
+import time
+import glob
+from decimal import Decimal, InvalidOperation
+import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIME_BUDGET_SECONDS = 95  # leave real headroom under the 2-minute ceiling
+MINIVM_TIMEOUT = 5
+OPTIMIZER_TIMEOUT = 15
+
+KEYWORDS = {"NULL", "TRUE", "FALSE", "ASC", "DESC", "NF", "NL", "NULLEQ"}
+REG_RE = re.compile(r"^[A-Za-z_]\w*$")
+SORTKEY_RE = re.compile(r"^([A-Za-z_]\w*)(\s+(?:ASC|DESC)\s+(?:NF|NL))$", re.IGNORECASE)
+INT_LIT_RE = re.compile(r"^-?\d+$")
+NUM_LIT_RE = re.compile(r"^-?\d+\.\d+$")
+DEST_COUNT = {"OUT": 0, "NLJOIN": 2, "HJOIN": 2}
+
+
+def minivm_path():
+    """bin/minivm is a `#!/bin/sh` dispatcher to the right platform binary
+    (see its source); reimplemented here so no shell is required to invoke
+    it (native Windows Python, in particular, cannot exec a shebang file)."""
+    import platform
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    os_name = {"darwin": "macos", "windows": "windows"}.get(system, system)
+    arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    ext = ".exe" if os_name == "windows" else ""
+    specific = os.path.join(HERE, "bin", "minivm-%s-%s%s" % (os_name, arch, ext))
+    if os.path.exists(specific):
+        return specific
+    generic = os.path.join(HERE, "bin", "minivm")
+    if os.path.exists(generic):
+        return generic
+    raise RuntimeError("no bin/minivm build found for %s-%s" % (os_name, arch))
+
+
+# --------------------------------------------------------------------------
+# Minimal program parser (standalone -- evaluate must not depend on
+# optimize.py's internals, since it has to test *any* optimizer).
+# --------------------------------------------------------------------------
+
+
+def is_register(tok):
+    return bool(REG_RE.match(tok)) and tok.upper() not in KEYWORDS
+
+
+def split_operands(text):
+    parts, cur, in_str = [], [], False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    cur.append("''")
+                    i += 2
+                    continue
+                in_str = False
+            cur.append(c)
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            cur.append(c)
+            i += 1
+            continue
+        if c == ",":
+            parts.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    return [p.strip() for p in parts]
+
+
+def strip_comment(line):
+    in_str = False
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == "'":
+                if i + 1 < n and line[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            i += 1
+            continue
+        if c == ";":
+            return line[:i]
+        i += 1
+    return line
+
+
+def parse_program(text):
+    """Returns list of (op, dest_names, src_chunks) -- src_chunks are raw
+    operand strings after the destination(s)."""
+    instrs = []
+    for raw_line in text.splitlines():
+        code = strip_comment(raw_line).strip()
+        if not code:
+            continue
+        m = re.match(r"^(\S+)\s*(.*)$", code)
+        op = m.group(1).upper()
+        rest = m.group(2).strip()
+        chunks = split_operands(rest) if rest else []
+        ndest = DEST_COUNT.get(op, 1)
+        dests = chunks[:ndest]
+        srcs = chunks[ndest:]
+        instrs.append((op, dests, srcs))
+    return instrs
+
+
+def chunk_reg(chunk):
+    m = SORTKEY_RE.match(chunk)
+    if m and is_register(m.group(1)):
+        return m.group(1)
+    if is_register(chunk):
+        return chunk
+    return None
+
+
+def order_matters(instrs):
+    """True iff every OUT operand is carried by a SORT/TOPK's position output
+    (through GATHER chains only); the conservative default is False."""
+    order_carrying = set()
+    for op, dests, srcs in instrs:
+        if op in ("SORT", "TOPK"):
+            order_carrying.add(dests[0])
+        elif op == "GATHER":
+            i_reg = chunk_reg(srcs[1])
+            if i_reg in order_carrying:
+                order_carrying.add(dests[0])
+        elif op == "OUT":
+            out_regs = [chunk_reg(c) for c in srcs]
+            return bool(out_regs) and all(r in order_carrying for r in out_regs)
+    return False
+
+
+# --------------------------------------------------------------------------
+# Value comparison: 1e-6 relative tolerance on anything numeric, exact
+# elsewhere.
+# --------------------------------------------------------------------------
+
+
+def try_parse_number(s):
+    if INT_LIT_RE.match(s) or NUM_LIT_RE.match(s):
+        try:
+            return Decimal(s)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def numbers_close(a, b):
+    if a == b:
+        return True
+    scale = max(abs(a), abs(b))
+    if scale == 0:
+        return a == b
+    return abs(a - b) / scale <= Decimal("1e-6")
+
+
+def values_equal(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return numbers_close(Decimal(str(a)), Decimal(str(b)))
+    if isinstance(a, str) and isinstance(b, str):
+        da, db = try_parse_number(a), try_parse_number(b)
+        if da is not None and db is not None:
+            return numbers_close(da, db)
+        return a == b
+    return a == b
+
+
+def rows_equal_ordered(a, b):
+    if len(a) != len(b):
+        return False
+    for ra, rb in zip(a, b):
+        if len(ra) != len(rb) or not all(values_equal(x, y) for x, y in zip(ra, rb)):
+            return False
+    return True
+
+
+def rows_equal_unordered(a, b):
+    if len(a) != len(b):
+        return False
+    used = [False] * len(b)
+    for ra in a:
+        found = False
+        for j, rb in enumerate(b):
+            if used[j]:
+                continue
+            if len(ra) == len(rb) and all(values_equal(x, y) for x, y in zip(ra, rb)):
+                used[j] = True
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Constraint-respecting random table-set generator.
+# --------------------------------------------------------------------------
+
+
+def to_decimal(v):
+    return None if v is None else Decimal(str(v))
+
+
+class TableDef:
+    def __init__(self, name, raw):
+        self.name = name
+        self.columns = [(c["name"], c["type"]) for c in raw.get("columns", [])]
+        self.key = [k for k in raw.get("key", [])]
+        self.not_null = set(x.lower() for x in raw.get("not_null", [])) | set(
+            k.lower() for k in self.key
+        )
+        self.refs = {k.lower(): v for k, v in raw.get("refs", {}).items()}
+        self.check = {k.lower(): v for k, v in raw.get("check", {}).items()}
+        self.sorted = [c for c in raw.get("sorted", [])]
+
+
+def topo_order(tables):
+    deps = {}
+    for name, t in tables.items():
+        d = set()
+        for col, ref in t.refs.items():
+            rtable = ref.split(".", 1)[0].lower()
+            if rtable != name:
+                d.add(rtable)
+        deps[name] = d
+    order = []
+    seen = set()
+
+    def visit(n):
+        if n in seen:
+            return
+        seen.add(n)
+        for d in deps.get(n, ()):
+            visit(d)
+        order.append(n)
+
+    for n in tables:
+        visit(n)
+    return order
+
+
+RNG_STR_VOCAB = ["", "a", "ab", "abc", "foo", "bar", "baz", "xy", "straße", "Zoë", "  pad  "]
+
+
+def gen_int(rng, lo, hi, not_null, pool, force_pool=False):
+    if not force_pool and not not_null and rng.random() < 0.15:
+        return None
+    lo_v = int(lo) if lo is not None else -1000
+    hi_v = int(hi) if hi is not None else 1000
+    if pool and (force_pool or rng.random() < 0.35):
+        base = rng.choice(pool)
+        for cand in (base, base - 1, base + 1):
+            if lo_v <= cand <= hi_v:
+                return cand
+    if not force_pool and rng.random() < 0.2:
+        return rng.choice([lo_v, hi_v])
+    return rng.randint(lo_v, hi_v)
+
+
+def gen_num(rng, lo, hi, not_null, pool, force_pool=False):
+    if not force_pool and not not_null and rng.random() < 0.15:
+        return None
+    lo_v = to_decimal(lo) if lo is not None else Decimal("-1000")
+    hi_v = to_decimal(hi) if hi is not None else Decimal("1000")
+    if pool and (force_pool or rng.random() < 0.35):
+        base = rng.choice(pool)
+        cent = Decimal("0.01")
+        for cand in (base, base - cent, base + cent):
+            if lo_v <= cand <= hi_v:
+                return str(cand)
+    if not force_pool and rng.random() < 0.2:
+        return str(rng.choice([lo_v, hi_v]))
+    span = hi_v - lo_v
+    frac = Decimal(str(rng.random()))
+    val = (lo_v + span * frac).quantize(Decimal("0.01"))
+    return str(val)
+
+
+def gen_str(rng, not_null, force_pool=False):
+    if not force_pool and not not_null and rng.random() < 0.15:
+        return None
+    return rng.choice(RNG_STR_VOCAB)
+
+
+def parse_iso_date(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def gen_date(rng, lo, hi, not_null, pool, year_pool, force_pool=False):
+    if not force_pool and not not_null and rng.random() < 0.15:
+        return None
+    lo_d = parse_iso_date(lo) if lo else datetime.date(1990, 1, 1)
+    hi_d = parse_iso_date(hi) if hi else datetime.date(2030, 12, 31)
+    if pool and (force_pool or rng.random() < 0.35):
+        base = rng.choice(pool)
+        for delta in (0, -1, 1):
+            cand = base + datetime.timedelta(days=delta)
+            if lo_d <= cand <= hi_d:
+                return cand.isoformat()
+    if year_pool and (force_pool or rng.random() < 0.35):
+        # A bare integer literal that looks like a year (e.g. `YEAR x = 2024`)
+        # doesn't parse as a DATE literal, but a program comparing YEAR(col)
+        # against one needs the column's actual year to land there for
+        # random data to ever exercise that branch at all.
+        y = rng.choice(year_pool)
+        try:
+            cand = datetime.date(y, rng.randint(1, 12), rng.randint(1, 28))
+            if lo_d <= cand <= hi_d:
+                return cand.isoformat()
+        except ValueError:
+            pass
+    span = (hi_d - lo_d).days
+    if span <= 0:
+        return lo_d.isoformat()
+    d = lo_d + datetime.timedelta(days=rng.randint(0, span))
+    return d.isoformat()
+
+
+def gen_value(rng, ctype, lo, hi, not_null, literal_pool, force_pool=False):
+    pool = (literal_pool or {}).get(ctype, [])
+    if ctype == "INT":
+        return gen_int(rng, lo, hi, not_null, pool, force_pool)
+    if ctype == "NUM":
+        return gen_num(rng, lo, hi, not_null, pool, force_pool)
+    if ctype == "STR":
+        return gen_str(rng, not_null, force_pool)
+    if ctype == "DATE":
+        year_pool = (literal_pool or {}).get("YEAR", [])
+        return gen_date(rng, lo, hi, not_null, pool, year_pool, force_pool)
+    raise ValueError(ctype)
+
+
+def harvest_literals(program_text):
+    """Pull every INT/NUM/DATE literal constant out of a program's source so
+    the random-data generator can bias values near them -- the boundaries a
+    program's own comparisons test are exactly where a subtly-wrong rewrite
+    (an off-by-one threshold, a flipped inequality) is likeliest to show up,
+    and generic uniform random data over a wide default range will rarely
+    land there by chance."""
+    pool = {"INT": [], "NUM": [], "DATE": []}
+    for line in program_text.splitlines():
+        code = strip_comment(line)
+        for tok in re.findall(r"-?\d+\.\d+|-?\d+|#\d{4}-\d{2}-\d{2}#", code):
+            if tok.startswith("#"):
+                pool["DATE"].append(parse_iso_date(tok.strip("#")))
+            elif "." in tok:
+                pool["NUM"].append(Decimal(tok))
+            else:
+                pool["INT"].append(int(tok))
+    pool["YEAR"] = [v for v in pool["INT"] if 1 <= v <= 9999]
+    return pool
+
+
+def sort_key_fn(col_idxs):
+    """Ascending, NULLs-first key, as the `sorted` table constraint requires.
+    NUM values are stored as decimal strings; compare them numerically, not
+    lexicographically (lexicographic order is wrong for e.g. '9' vs '10')."""
+
+    def one(v):
+        if v is None:
+            return (0, 0)
+        if isinstance(v, str):
+            d = try_parse_number(v)
+            if d is not None:
+                return (1, d)
+        return (1, v)
+
+    def key(row):
+        return tuple(one(row[idx]) for idx in col_idxs)
+
+    return key
+
+
+def gen_row(t, rng, literal_pool, key_pools, anchor_key, force_pool):
+    """One row for table t. In force_pool mode every non-ref column is
+    biased toward the program's own literal constants, and every ref column
+    chains to the referenced table's *anchor* row specifically (falling
+    back to a random pool pick if that table has no anchor, e.g. it has no
+    declared key at all). Returns None if a required ref has no candidate."""
+    row = {}
+    for col, ctype in t.columns:
+        cl = col.lower()
+        if cl in t.refs:
+            rtable = t.refs[cl].split(".", 1)[0].lower()
+            pool = key_pools.get(rtable, [])
+            not_null = cl in t.not_null
+            if not pool:
+                if not_null:
+                    return None
+                row[col] = None
+                continue
+            if force_pool:
+                row[col] = anchor_key.get(rtable, rng.choice(pool))
+            elif not not_null and rng.random() < 0.15:
+                row[col] = None
+            else:
+                row[col] = rng.choice(pool)
+            continue
+        lo, hi = t.check.get(cl, (None, None))
+        row[col] = gen_value(rng, ctype, lo, hi, cl in t.not_null, literal_pool, force_pool)
+    return row
+
+
+def generate_tableset(schema, rng, max_rows, literal_pool=None):
+    tables = {name.lower(): TableDef(name, raw) for name, raw in schema.items()}
+    orig_name = {name.lower(): name for name in schema}
+    order = topo_order(tables)
+    key_pools = {}  # table -> list of key values (single-column keys only)
+    anchor_key = {}  # table -> the one deliberately-chained row's key value
+    result = {}
+
+    for tname in order:
+        t = tables[tname]
+        # Mostly substantial tables (so FK chains actually plumb through
+        # several joins/groups), with occasional 0/1-row edge cases.
+        n = rng.choice(
+            [0, 1, rng.randint(3, max_rows), rng.randint(3, max_rows), rng.randint(3, max_rows)]
+        )
+        key_cols = [c.lower() for c in t.key]
+        key_col_names = [c for c, _ in t.columns if c.lower() in key_cols]
+
+        rows = []
+        used_keys = set()
+        attempts = 0
+        while len(rows) < n and attempts < n * 20 + 50:
+            attempts += 1
+            row = gen_row(t, rng, literal_pool, key_pools, anchor_key, force_pool=False)
+            if row is None:
+                continue
+            if key_col_names:
+                kv = tuple(row[c] for c in key_col_names)
+                if kv in used_keys:
+                    continue
+                used_keys.add(kv)
+            rows.append(row)
+
+        # One deliberately-chained, literal-biased row per table: random FK
+        # selection makes a long, narrow join/filter chain (several tables
+        # deep) an improbable coincidence to hit by chance; explicitly
+        # threading one row's keys through every ref keeps at least one path
+        # all the way from root tables to leaves exercising the program's
+        # own comparison constants.
+        anchor_kv = None
+        for _ in range(10):
+            row = gen_row(t, rng, literal_pool, key_pools, anchor_key, force_pool=True)
+            if row is None:
+                break
+            if key_col_names:
+                kv = tuple(row[c] for c in key_col_names)
+                if kv in used_keys:
+                    continue
+                used_keys.add(kv)
+                anchor_kv = kv
+            rows.append(row)
+            break
+
+        col_order = [c for c, _ in t.columns]
+        row_lists = [[r[c] for c in col_order] for r in rows]
+
+        if t.sorted:
+            idxs = [col_order.index(c) for c in t.sorted]
+            row_lists.sort(key=sort_key_fn(idxs))
+
+        if len(key_cols) == 1:
+            kidx = col_order.index(
+                next(c for c in col_order if c.lower() == key_cols[0])
+            )
+            key_pools[tname] = [r[kidx] for r in row_lists]
+            if anchor_kv is not None:
+                anchor_key[tname] = anchor_kv[0]
+
+        out_tdef = {"columns": [{"name": c, "type": ty} for c, ty in t.columns]}
+        if t.key:
+            out_tdef["key"] = t.key
+        if t.not_null - set(k.lower() for k in t.key):
+            out_tdef["not_null"] = [
+                c for c, _ in t.columns if c.lower() in t.not_null and c.lower() not in key_cols
+            ]
+        if t.refs:
+            out_tdef["refs"] = {c: v for c, v in schema[orig_name[tname]].get("refs", {}).items()}
+        if t.check:
+            out_tdef["check"] = {c: v for c, v in schema[orig_name[tname]].get("check", {}).items()}
+        if t.sorted:
+            out_tdef["sorted"] = t.sorted
+        out_tdef["rows"] = row_lists
+        result[orig_name[tname]] = out_tdef
+
+    return result
+
+
+# --------------------------------------------------------------------------
+# Running bin/minivm and the optimizer under test.
+# --------------------------------------------------------------------------
+
+
+def run_minivm(program_path, tableset_path):
+    try:
+        p = subprocess.run(
+            [minivm_path(), program_path, tableset_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=MINIVM_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    try:
+        return json.loads(p.stdout), None
+    except ValueError:
+        return None, "bad JSON from minivm: " + p.stdout[:200]
+
+
+def shebang_prefix(path):
+    """On native Windows, a #!-script can't be exec'd directly (no POSIX
+    exec semantics); resolve its interpreter so subprocess can invoke it.
+    No-op on POSIX, where the OS handles the shebang itself."""
+    if os.name != "nt":
+        return []
+    try:
+        with open(path, "rb") as f:
+            first = f.readline()
+    except OSError:
+        return []
+    if not first.startswith(b"#!"):
+        return []
+    parts = first[2:].decode("utf-8", "replace").split()
+    if not parts:
+        return []
+    if parts[0].endswith("env") and len(parts) > 1:
+        return [parts[1]]
+    return [parts[0]]
+
+
+def run_optimizer(optimizer, program_path, schema_path):
+    cmd = shebang_prefix(optimizer) + [optimizer, program_path, schema_path]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=OPTIMIZER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "optimizer timed out"
+    if p.returncode != 0:
+        return None, "optimizer exited %d: %s" % (p.returncode, p.stderr.strip()[:300])
+    if not p.stdout.strip():
+        return None, "optimizer produced empty output"
+    return p.stdout, None
+
+
+class Defect(Exception):
+    pass
+
+
+def compare_results(orig_result, opt_result, orig_text):
+    if orig_result["ncols"] != opt_result["ncols"]:
+        raise Defect("ncols differ: %r vs %r" % (orig_result["ncols"], opt_result["ncols"]))
+    instrs = parse_program(orig_text)
+    if order_matters(instrs):
+        ok = rows_equal_ordered(orig_result["rows"], opt_result["rows"])
+    else:
+        ok = rows_equal_unordered(orig_result["rows"], opt_result["rows"])
+    if not ok:
+        raise Defect(
+            "rows differ (order_matters=%s): orig=%r... opt=%r..."
+            % (order_matters(instrs), orig_result["rows"][:3], opt_result["rows"][:3])
+        )
+
+
+def check_program_against_dataset(program_path, opt_path, orig_text, tableset_path):
+    orig_result, orig_err = run_minivm(program_path, tableset_path)
+    if orig_result is None:
+        return  # original errored: anything goes
+    opt_result, opt_err = run_minivm(opt_path, tableset_path)
+    if opt_result is None:
+        raise Defect("optimized program errored where original succeeded: %s" % opt_err)
+    compare_results(orig_result, opt_result, orig_text)
+
+
+def evaluate_program(optimizer, program_path, schema_path, schema, deadline, label, extra_datasets):
+    with open(program_path, "r", encoding="utf-8") as f:
+        orig_text = f.read()
+    opt_text, err = run_optimizer(optimizer, program_path, schema_path)
+    if opt_text is None:
+        raise Defect("%s: %s" % (label, err))
+    opt_fh = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".mini", delete=False, encoding="utf-8"
+    )
+    opt_fh.write(opt_text)
+    opt_fh.close()
+    try:
+        for ds_path in extra_datasets:
+            if time.monotonic() > deadline:
+                break
+            try:
+                check_program_against_dataset(program_path, opt_fh.name, orig_text, ds_path)
+            except Defect as d:
+                raise Defect("%s on %s: %s" % (label, os.path.basename(ds_path), d))
+    finally:
+        os.unlink(opt_fh.name)
+
+
+def make_dataset_file(tableset, scratch_dir, idx):
+    path = os.path.join(scratch_dir, "fuzz_%03d.json" % idx)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tableset, f)
+    return path
+
+
+SYNTHETIC = [
+    (
+        {
+            "t": {
+                "columns": [
+                    {"name": "a", "type": "INT"},
+                    {"name": "b", "type": "INT"},
+                ],
+                "not_null": ["a"],
+                "check": {"b": [-1000, 1000]},
+            }
+        },
+        """
+        LOAD a, t.a
+        LOAD b, t.b
+        DIV  d, a, b
+        IDIV i, a, b
+        MOD  m, a, b
+        NEG  n, a
+        WRAP w, a
+        OUT  d, i, m, n, w
+        """,
+    ),
+    (
+        {
+            "t": {
+                "columns": [
+                    {"name": "s", "type": "STR"},
+                    {"name": "n", "type": "INT"},
+                ],
+                "not_null": ["n"],
+            }
+        },
+        """
+        LOAD s, t.s
+        LOAD n, t.n
+        TOPK k, 3, n DESC NL
+        GATHER os, s, k
+        GATHER on, n, k
+        OUT os, on
+        """,
+    ),
+    (
+        {
+            "l": {"columns": [{"name": "k", "type": "INT"}, {"name": "v", "type": "STR"}]},
+            "r": {"columns": [{"name": "k", "type": "INT"}, {"name": "w", "type": "STR"}]},
+        },
+        """
+        LOAD lk, l.k
+        LOAD rk, r.k
+        NLJOIN li, ri, lk, rk, NULLEQ
+        LOAD lv, l.v
+        LOAD rw, r.w
+        GATHER a, lv, li
+        GATHER b, rw, ri
+        OUT a, b
+        """,
+    ),
+    (
+        {
+            "d": {"columns": [{"name": "x", "type": "DATE"}, {"name": "g", "type": "STR"}]},
+        },
+        """
+        LOAD x, d.x
+        LOAD g, d.g
+        GROUP grp, g
+        GMIN mn, grp, x
+        GMAX mx, grp, x
+        DATEDIFF diff, mx, mn
+        DATEADD plus, mx, 10
+        GFIRST f, grp
+        GATHER key, g, f
+        OUT key, mn, mx, diff, plus
+        """,
+    ),
+]
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: evaluate OPTIMIZER", file=sys.stderr)
+        sys.exit(2)
+    optimizer = sys.argv[1]
+    start = time.monotonic()
+    deadline = start + TIME_BUDGET_SECONDS
+
+    defects = []
+
+    with open(os.path.join(HERE, "examples", "schema.json"), encoding="utf-8") as f:
+        bundled_schema = json.load(f)
+    bundled_schema_path = os.path.join(HERE, "examples", "schema.json")
+    bundled_programs = sorted(glob.glob(os.path.join(HERE, "examples", "programs", "*.mini")))
+    bundled_programs += sorted(
+        glob.glob(os.path.join(HERE, "examples", "programs-extra", "*.mini"))
+    )
+    bundled_data = os.path.join(HERE, "examples", "data.json")
+
+    scratch = tempfile.mkdtemp(prefix="minivm_eval_")
+    rng = random.Random(0)
+
+    try:
+        # Layer 1: regression against the bundled example data, exactly.
+        for prog in bundled_programs:
+            if time.monotonic() > deadline:
+                break
+            try:
+                evaluate_program(
+                    optimizer, prog, bundled_schema_path, bundled_schema,
+                    deadline, os.path.basename(prog), [bundled_data],
+                )
+            except Defect as d:
+                defects.append(str(d))
+
+        # Layer 2: fuzz random data against the bundled schema + programs.
+        # Each program gets its own batch of datasets, biased toward the
+        # literal constants that program's own comparisons use (see
+        # harvest_literals) -- that's where an off-by-one or flipped-sense
+        # rewrite of a filter is likeliest to surface.
+        ds_counter = [0]
+
+        def fresh_datasets(schema_for_gen, text_for_literals, n, max_rows):
+            pool = harvest_literals(text_for_literals)
+            out = []
+            for _ in range(n):
+                if time.monotonic() > deadline:
+                    break
+                ts = generate_tableset(schema_for_gen, rng, max_rows, pool)
+                ds_counter[0] += 1
+                out.append(make_dataset_file(ts, scratch, ds_counter[0]))
+            return out
+
+        for prog in bundled_programs:
+            if time.monotonic() > deadline:
+                break
+            with open(prog, encoding="utf-8") as f:
+                prog_text = f.read()
+            fuzz_datasets = fresh_datasets(bundled_schema, prog_text, 50, 30)
+            try:
+                evaluate_program(
+                    optimizer, prog, bundled_schema_path, bundled_schema,
+                    deadline, os.path.basename(prog) + " [fuzz]", fuzz_datasets,
+                )
+            except Defect as d:
+                defects.append(str(d))
+
+        # Layer 3: small synthetic programs covering opcodes the bundled
+        # examples don't exercise (DIV/IDIV/MOD, TOPK, NLJOIN+NULLEQ, dates).
+        for idx, (syn_schema, syn_prog_text) in enumerate(SYNTHETIC):
+            if time.monotonic() > deadline:
+                break
+            prog_path = os.path.join(scratch, "syn_%d.mini" % idx)
+            with open(prog_path, "w", encoding="utf-8") as f:
+                f.write(syn_prog_text)
+            schema_path = os.path.join(scratch, "syn_%d.schema.json" % idx)
+            with open(schema_path, "w", encoding="utf-8") as f:
+                json.dump(syn_schema, f)
+            syn_datasets = fresh_datasets(syn_schema, syn_prog_text, 20, 20)
+            try:
+                evaluate_program(
+                    optimizer, prog_path, schema_path, syn_schema,
+                    deadline, "synthetic#%d" % idx, syn_datasets,
+                )
+            except Defect as d:
+                defects.append(str(d))
+    finally:
+        pass  # leave scratch dir for inspection; OS temp cleanup handles it
+
+    if defects:
+        print("FOUND %d defect(s):" % len(defects), file=sys.stderr)
+        for d in defects[:20]:
+            print(" -", d, file=sys.stderr)
+        sys.exit(1)
+    print("no defects found (%.1fs elapsed)" % (time.monotonic() - start), file=sys.stderr)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

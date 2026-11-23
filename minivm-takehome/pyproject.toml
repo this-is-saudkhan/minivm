@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 100
+extend-include = ["optimize", "evaluate"]  # no .py extension, so not auto-discovered
+
+[tool.ruff.lint]
+# Basic checks for now: pyflakes (real correctness issues -- unused imports,
+# undefined names, etc.) and pycodestyle (E/W). Deliberately not enabling
+# pyupgrade (UP) or refurb (FURB): this project targets Python 3.6 on
+# purpose (see docs/APPROACH.md), and those rulesets suggest syntax that
+# isn't available there.
+select = ["E", "F", "W"]

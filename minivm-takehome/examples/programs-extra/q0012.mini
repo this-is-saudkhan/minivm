@@ -1,0 +1,30 @@
+; For each order with at least one payment: days from order date to its
+; latest payment, whether that's over 14 days, the order's weekday, and its
+; 14-day-from-order due date, by order id.
+; Exercises: DATEDIFF, DATEADD, DOW -- none of the 8 bundled examples use
+; DATEDIFF or DATEADD at all, and q0007's one DOW call is dead code (its
+; result is never read).
+LOAD o_id, orders.o_id
+LOAD o_date, orders.o_date
+LOAD y_order, payments.y_order
+LOAD y_date, payments.y_date
+HJOIN li, ri, o_id, y_order
+GATHER g_oid, o_id, li
+GATHER g_odate, o_date, li
+GATHER g_ydate, y_date, ri
+GROUP g, g_oid
+GMAX latest_pay, g, g_ydate
+GFIRST f, g
+GATHER rep_oid, g_oid, f
+GATHER rep_odate, g_odate, f
+DATEDIFF lag, latest_pay, rep_odate
+GT overdue, lag, 14
+DOW wd, rep_odate
+DATEADD due, rep_odate, 14
+SORT s, rep_oid ASC NF
+GATHER o_oid, rep_oid, s
+GATHER o_lag, lag, s
+GATHER o_overdue, overdue, s
+GATHER o_wd, wd, s
+GATHER o_due, due, s
+OUT o_oid, o_lag, o_overdue, o_wd, o_due

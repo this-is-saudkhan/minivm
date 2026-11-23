@@ -1,3 +1,583 @@
-#!/bin/sh
-# ./optimize program.mini schema.json  ->  an equivalent MiniVM program
-cat "$1"
+#!/usr/bin/env python3
+"""./optimize program.mini schema.json -> an equivalent, cheaper MiniVM program.
+
+Pipeline (see PLAN.md for the full design writeup):
+  1. Parse the program into instructions, classifying every operand token
+     (register / literal / table.column / sort-key / flag) purely from its
+     surface syntax -- the MiniVM grammar never requires opcode-specific
+     knowledge to tell these apart.
+  2. One forward sweep that, per register, tracks:
+       - value-numbering / CSE: identical (op, resolved-operands) is reused.
+       - "length class" (union-find): which registers are guaranteed, by
+         the instruction set's own length rules, to have the same row count.
+       - numeric bounds + not_null, propagated through LOAD/GATHER/SLICE,
+         using only schema *constraints* (never the data-specific stats),
+         so conclusions hold for any table set conforming to the schema.
+       - comparisons whose bounds prove them TRUE at every row are flagged;
+         a GATHER through such a proven-TRUE filter's index is then just an
+         alias for its source column (dropped, not re-emitted).
+  3. Backward liveness pass (dead-code elimination) from the OUT operands.
+     This also cleans up whatever the filter-elision in step 2 orphaned.
+  4. A local, always-safe HJOIN<->NLJOIN swap using schema stats.rows as a
+     cost estimate (the two instructions are documented to always agree on
+     results, so this cannot change correctness, only speed).
+  5. Re-serialize. Every literal/table.column/keyword token is re-emitted
+     verbatim from the source text; only register names are ever rewritten
+     (via alias substitution), so there is no risk of reformatting a NUM
+     literal and losing exact precision.
+
+If anything about the input doesn't match what this optimizer understands
+(parse failure, unknown opcode, etc.) it falls back to emitting the
+original program unchanged -- never a best-effort guess.
+"""
+import sys
+import re
+import json
+from decimal import Decimal
+
+KEYWORDS = {"NULL", "TRUE", "FALSE", "ASC", "DESC", "NF", "NL", "NULLEQ"}
+REG_RE = re.compile(r"^[A-Za-z_]\w*$")
+SORTKEY_RE = re.compile(r"^([A-Za-z_]\w*)(\s+(?:ASC|DESC)\s+(?:NF|NL))$", re.IGNORECASE)
+INT_LIT_RE = re.compile(r"^-?\d+$")
+NUM_LIT_RE = re.compile(r"^-?\d+\.\d+$")
+
+DEST_COUNT = {"OUT": 0, "NLJOIN": 2, "HJOIN": 2}
+
+
+def is_register(tok):
+    return bool(REG_RE.match(tok)) and tok.upper() not in KEYWORDS
+
+
+def literal_numeric(tok):
+    if INT_LIT_RE.match(tok) or NUM_LIT_RE.match(tok):
+        try:
+            return Decimal(tok)
+        except Exception:
+            return None
+    return None
+
+
+def split_operands(text):
+    """Comma-split at top level, respecting '' escaping inside '...' strings."""
+    parts = []
+    cur = []
+    in_str = False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    cur.append("''")
+                    i += 2
+                    continue
+                in_str = False
+                cur.append(c)
+                i += 1
+                continue
+            cur.append(c)
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            cur.append(c)
+            i += 1
+            continue
+        if c == ",":
+            parts.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip() != "" or len(parts) == 1]
+
+
+def strip_comment(line):
+    in_str = False
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == "'":
+                if i + 1 < n and line[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            i += 1
+            continue
+        if c == ";":
+            return line[:i]
+        i += 1
+    return line
+
+
+class Chunk:
+    __slots__ = ("raw", "kind", "reg", "suffix")
+
+    def __init__(self, raw):
+        self.raw = raw
+        m = SORTKEY_RE.match(raw)
+        if m and is_register(m.group(1)):
+            self.kind = "sortkey"
+            self.reg = m.group(1)
+            self.suffix = m.group(2)
+        elif is_register(raw):
+            self.kind = "reg"
+            self.reg = raw
+            self.suffix = None
+        else:
+            self.kind = "other"
+            self.reg = None
+            self.suffix = None
+
+    def render(self, resolve):
+        if self.kind == "reg":
+            return resolve(self.reg)
+        if self.kind == "sortkey":
+            return resolve(self.reg) + self.suffix
+        return self.raw
+
+
+class Instr:
+    __slots__ = ("lineno", "op", "dests", "srcs")
+
+    def __init__(self, lineno, op, dests, srcs):
+        self.lineno = lineno
+        self.op = op
+        self.dests = dests  # list[str] register names
+        self.srcs = srcs  # list[Chunk]
+
+    def src_regs(self):
+        for c in self.srcs:
+            if c.kind in ("reg", "sortkey"):
+                yield c.reg
+
+
+class ParseError(Exception):
+    pass
+
+
+def parse(text):
+    instrs = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        code = strip_comment(raw_line).strip()
+        if not code:
+            continue
+        m = re.match(r"^(\S+)\s*(.*)$", code)
+        if not m:
+            raise ParseError(f"line {lineno}: cannot parse")
+        op = m.group(1).upper()
+        rest = m.group(2).strip()
+        chunks_text = split_operands(rest) if rest else []
+        ndest = DEST_COUNT.get(op, 1)
+        if len(chunks_text) < ndest:
+            raise ParseError(f"line {lineno}: {op}: too few operands")
+        dest_text = chunks_text[:ndest]
+        for d in dest_text:
+            if not is_register(d):
+                raise ParseError(f"line {lineno}: {op}: bad destination {d!r}")
+        srcs = [Chunk(c) for c in chunks_text[ndest:]]
+        instrs.append(Instr(lineno, op, dest_text, srcs))
+    if not instrs or instrs[-1].op != "OUT":
+        raise ParseError("program must end with a single OUT")
+    for ins in instrs[:-1]:
+        if ins.op == "OUT":
+            raise ParseError("OUT must be the only one, and last")
+    return instrs
+
+
+# --------------------------------------------------------------------------
+# Schema-derived static facts (constraints only -- never per-dataset stats,
+# so conclusions hold for *any* table set conforming to the schema).
+# --------------------------------------------------------------------------
+
+
+class Facts:
+    __slots__ = ("lo", "hi", "not_null")
+
+    def __init__(self, lo=None, hi=None, not_null=False):
+        self.lo = lo
+        self.hi = hi
+        self.not_null = not_null
+
+
+UNKNOWN_FACTS = Facts()
+
+
+def to_decimal(v):
+    if v is None:
+        return None
+    return Decimal(str(v))
+
+
+def build_column_facts(schema):
+    facts = {}
+    for table, tdef in schema.items():
+        cols = {c["name"]: c["type"] for c in tdef.get("columns", [])}
+        not_null = set(x.lower() for x in tdef.get("not_null", []))
+        for k in tdef.get("key", []):
+            not_null.add(k.lower())
+        check = tdef.get("check", {})
+        check_lower = {k.lower(): v for k, v in check.items()}
+        for col, ctype in cols.items():
+            lo = hi = None
+            if ctype in ("INT", "NUM") and col.lower() in check_lower:
+                lo_raw, hi_raw = check_lower[col.lower()]
+                lo, hi = to_decimal(lo_raw), to_decimal(hi_raw)
+            facts[(table.lower(), col.lower())] = Facts(lo, hi, col.lower() in not_null)
+    return facts
+
+
+def build_table_rows(schema):
+    rows = {}
+    for table, tdef in schema.items():
+        stats = tdef.get("stats", {})
+        if "rows" in stats:
+            rows[table.lower()] = stats["rows"]
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Union-find for "same length" register classes.
+# --------------------------------------------------------------------------
+
+
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+
+    def _root(self, x):
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def find(self, x):
+        if x is None:
+            return None
+        return self._root(x)
+
+    def union(self, a, b):
+        if a is None or b is None:
+            return
+        ra, rb = self._root(a), self._root(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+
+_next_id = [0]
+
+
+def fresh_id():
+    _next_id[0] += 1
+    return ("id", _next_id[0])
+
+
+# --------------------------------------------------------------------------
+# Comparison folding: is `op(a, b)` provably TRUE at every row, given static
+# bounds/not_null facts on each side (a register's facts, or a literal's
+# degenerate [v, v] / not_null=True fact)?
+# --------------------------------------------------------------------------
+
+CMP_OPS = {"GT", "GE", "LT", "LE", "EQ"}
+
+
+def always_true(op, fa, fb):
+    both_not_null = fa.not_null and fb.not_null
+    if op == "GT":
+        return fa.lo is not None and fb.hi is not None and fa.lo > fb.hi and both_not_null
+    if op == "GE":
+        return fa.lo is not None and fb.hi is not None and fa.lo >= fb.hi and both_not_null
+    if op == "LT":
+        return fa.hi is not None and fb.lo is not None and fa.hi < fb.lo and both_not_null
+    if op == "LE":
+        return fa.hi is not None and fb.lo is not None and fa.hi <= fb.lo and both_not_null
+    if op == "EQ":
+        return (
+            fa.lo is not None and fa.lo == fa.hi == fb.lo == fb.hi
+            and fa.not_null and fb.not_null
+        )
+    return False
+
+
+def chunk_facts(chunk, reg_facts, resolve):
+    if chunk.kind == "reg":
+        return reg_facts.get(resolve(chunk.reg), UNKNOWN_FACTS)
+    if chunk.kind == "other":
+        v = literal_numeric(chunk.raw)
+        if v is not None:
+            return Facts(v, v, True)
+    return UNKNOWN_FACTS
+
+
+# Ops whose dest shares its single register-operand's length class.
+LEN_PASSTHROUGH_1 = {
+    "NEG", "WRAP", "TRUNC", "NOT", "ISNULL", "NULLIFE",
+    "UPPER", "RTRIM", "TRIM", "LEFT", "SUBSTR", "LEN",
+    "YEAR", "MONTH", "DAY", "DOW",
+}
+# Element-wise ops with 2 (register-or-literal) operands; dest shares length
+# class with whichever operand(s) are registers.
+LEN_PASSTHROUGH_2 = {
+    "ADD", "SUB", "MUL", "DIV", "IDIV", "MOD",
+    "EQ", "NE", "LT", "LE", "GT", "GE", "IS",
+    "AND", "OR", "NVL", "NULLIF", "CAT", "DATEADD", "DATEDIFF",
+}
+LEN_PASSTHROUGH_3 = {"IF"}  # c, a, b all required same length
+
+
+def optimize_program(instrs, schema):
+    column_facts = build_column_facts(schema)
+    uf = UnionFind()
+    table_class = {}
+
+    alias = {}  # register -> canonical register (only set when dropped)
+    reg_facts = {}
+    reg_class = {}
+    always_true_idx = {}  # idx-output register -> length-class of its condition
+    always_true_reg = set()  # registers provably BOOL-TRUE at every row
+    cse_cache = {}
+
+    def resolve(name):
+        seen = set()
+        while name in alias and name not in seen:
+            seen.add(name)
+            name = alias[name]
+        return name
+
+    kept = []
+
+    def set_dest_plain(d, fac=UNKNOWN_FACTS, cls=None):
+        alias.pop(d, None)
+        always_true_reg.discard(d)
+        always_true_idx.pop(d, None)
+        reg_facts[d] = fac
+        reg_class[d] = cls if cls is not None else fresh_id()
+
+    for ins in instrs:
+        op = ins.op
+        # Resolve every source register reference against current aliases for
+        # rendering and for the CSE key.
+        rendered = [c.render(resolve) for c in ins.srcs]
+
+        if op == "GATHER":
+            s_reg, i_reg = (c.reg for c in ins.srcs)
+            s_can, i_can = resolve(s_reg), resolve(i_reg)
+            d = ins.dests[0]
+            cond_class = always_true_idx.get(i_can)
+            if cond_class is not None and uf.find(cond_class) == uf.find(reg_class.get(s_can)):
+                alias[d] = s_can
+                reg_facts[d] = reg_facts.get(s_can, UNKNOWN_FACTS)
+                reg_class[d] = reg_class.get(s_can)
+                if s_can in always_true_idx:
+                    always_true_idx[d] = always_true_idx[s_can]
+                continue  # elided: do not emit
+            key = (op, tuple(rendered))
+            if key in cse_cache:
+                alias[d] = cse_cache[key][0]
+                reg_facts[d] = reg_facts.get(alias[d], UNKNOWN_FACTS)
+                reg_class[d] = reg_class.get(alias[d])
+                continue
+            cse_cache[key] = (d,)
+            i_class = uf.find(reg_class.get(i_can)) or fresh_id()
+            set_dest_plain(d, reg_facts.get(s_can, UNKNOWN_FACTS), i_class)
+            kept.append((ins, rendered))
+            continue
+
+        # Generic CSE for every other opcode: identical (op, resolved operands)
+        # is pure and may be reused, whatever it computes.
+        key = (op, tuple(rendered))
+        if op != "OUT" and key in cse_cache:
+            cached = cse_cache[key]
+            for d, c in zip(ins.dests, cached):
+                alias[d] = c
+                reg_facts[d] = reg_facts.get(c, UNKNOWN_FACTS)
+                reg_class[d] = reg_class.get(c)
+            continue
+
+        if op != "OUT":
+            cse_cache[key] = tuple(ins.dests)
+
+        kept.append((ins, rendered))
+
+        # -- update facts / length-classes / bool-facts for this dest --
+        if op == "LOAD":
+            table, col = ins.srcs[0].raw.split(".", 1)
+            tkey = table.lower()
+            cls = table_class.setdefault(tkey, fresh_id())
+            d = ins.dests[0]
+            set_dest_plain(d, column_facts.get((tkey, col.lower()), UNKNOWN_FACTS), cls)
+
+        elif op in ("SLICE", "FILL"):
+            s_reg = ins.srcs[-1].reg
+            s_can = resolve(s_reg)
+            d = ins.dests[0]
+            if op == "FILL":
+                # FILL's value is a literal repeated, not s's values -- no bound
+                # facts carry over, but its length matches s.
+                set_dest_plain(d, UNKNOWN_FACTS, reg_class.get(s_can))
+            else:
+                # SLICE takes a prefix: a subset of s's values, so s's bounds
+                # and not_null still hold; length may shrink, so a fresh class.
+                set_dest_plain(d, reg_facts.get(s_can, UNKNOWN_FACTS), fresh_id())
+
+        elif op == "IOTA":
+            s_can = resolve(ins.srcs[0].reg)
+            set_dest_plain(ins.dests[0], UNKNOWN_FACTS, reg_class.get(s_can))
+
+        elif op == "SORT":
+            key0 = ins.srcs[0].reg
+            set_dest_plain(ins.dests[0], UNKNOWN_FACTS, reg_class.get(resolve(key0)))
+
+        elif op == "IDX":
+            c_reg = resolve(ins.srcs[0].reg)
+            d = ins.dests[0]
+            set_dest_plain(d, UNKNOWN_FACTS, fresh_id())
+            if c_reg in always_true_reg:
+                cls = reg_class.get(c_reg)
+                if cls is not None:
+                    always_true_idx[d] = cls
+
+        elif op in LEN_PASSTHROUGH_1:
+            regs = [resolve(r) for r in ins.src_regs()]
+            cls = next((reg_class[r] for r in regs if r in reg_class), None)
+            set_dest_plain(ins.dests[0], UNKNOWN_FACTS, cls)
+
+        elif op in LEN_PASSTHROUGH_2 or op in LEN_PASSTHROUGH_3:
+            regs = [resolve(r) for r in ins.src_regs()]
+            cls = next((reg_class[r] for r in regs if r in reg_class), None)
+            for r in regs:
+                if r in reg_class:
+                    uf.union(reg_class[r], cls)
+            d = ins.dests[0]
+            is_always_true = False
+            if op in CMP_OPS and len(ins.srcs) == 2:
+                fa = chunk_facts(ins.srcs[0], reg_facts, resolve)
+                fb = chunk_facts(ins.srcs[1], reg_facts, resolve)
+                is_always_true = always_true(op, fa, fb)
+            set_dest_plain(d, UNKNOWN_FACTS, cls)
+            if is_always_true:
+                always_true_reg.add(d)
+
+        else:
+            # NLJOIN/HJOIN, GROUP, GALL, GID, GFIRST, GCOUNT, GCOUNTV, GSUM,
+            # GMIN, GMAX, TOPK: no statically-known length relationship to
+            # their operands is assumed (conservative default).
+            for d in ins.dests:
+                set_dest_plain(d, UNKNOWN_FACTS, fresh_id())
+
+    return kept
+
+
+def dce(kept):
+    """kept: list of (Instr, rendered_src_list). Backward liveness from OUT."""
+    out_ins, out_rendered = kept[-1]
+    assert out_ins.op == "OUT"
+    live = set(c.reg for c in out_ins.srcs if c.kind in ("reg", "sortkey"))
+    # rendered srcs already reflect post-alias names; recompute live regs from
+    # the rendered text since those are the canonical names actually used.
+    live = set()
+    for text in out_rendered:
+        if is_register(text):
+            live.add(text)
+    result = [kept[-1]]
+    for ins, rendered in reversed(kept[:-1]):
+        needed = any(d in live for d in ins.dests)
+        if needed:
+            result.append((ins, rendered))
+            live -= set(ins.dests)
+            for text in rendered:
+                if is_register(text):
+                    live.add(text)
+                else:
+                    m = re.match(r"^([A-Za-z_]\w*)\s", text)
+                    if m and is_register(m.group(1)):
+                        live.add(m.group(1))
+    result.reverse()
+    return result
+
+
+def choose_join_algo(kept, schema):
+    table_rows = build_table_rows(schema)
+    origin_table = {}
+
+    def resolve_origin(reg):
+        return origin_table.get(reg)
+
+    out = []
+    for ins, rendered in kept:
+        op = ins.op
+        if op == "LOAD":
+            table = ins.srcs[0].raw.split(".", 1)[0].lower()
+            origin_table[ins.dests[0]] = table
+        elif op in ("GATHER", "SLICE", "FILL", "IOTA"):
+            s = rendered[-1] if op != "GATHER" else rendered[0]
+            if is_register(s):
+                origin_table[ins.dests[0]] = origin_table.get(s)
+        elif op in LEN_PASSTHROUGH_1 or op in LEN_PASSTHROUGH_2 or op in LEN_PASSTHROUGH_3:
+            t = None
+            for r in rendered:
+                if is_register(r) and origin_table.get(r):
+                    t = origin_table[r]
+                    break
+            origin_table[ins.dests[0]] = t
+
+        if op in ("HJOIN", "NLJOIN") and len(rendered) >= 2:
+            lk, rk = rendered[0], rendered[1]
+            lt, rt = origin_table.get(lk), origin_table.get(rk)
+            lrows, rrows = table_rows.get(lt), table_rows.get(rt)
+            new_op = op
+            if lrows is not None and rrows is not None:
+                nl_cost = lrows * rrows
+                hj_cost = 6 * (lrows + rrows)
+                if nl_cost < hj_cost:
+                    new_op = "NLJOIN"
+                else:
+                    new_op = "HJOIN"
+            out.append((ins, new_op, rendered))
+            continue
+        out.append((ins, op, rendered))
+    return out
+
+
+def render_program(final):
+    lines = [
+        "; optimized by ./optimize -- dead-code elimination, common subexpression",
+        "; elimination, schema-constraint-proven filter elision, and HJOIN/NLJOIN",
+        "; algorithm choice. See PLAN.md for the design.",
+    ]
+    for ins, op, rendered in final:
+        operands = list(ins.dests) + list(rendered)
+        lines.append(f"{op} {', '.join(operands)}")
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: optimize program.mini schema.json", file=sys.stderr)
+        sys.exit(2)
+    prog_path, schema_path = sys.argv[1], sys.argv[2]
+    with open(prog_path, "r", encoding="utf-8") as f:
+        original_text = f.read()
+    try:
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        instrs = parse(original_text)
+        kept = optimize_program(instrs, schema)
+        kept = dce(kept)
+        final = choose_join_algo(kept, schema)
+        out_text = render_program(final)
+    except Exception:
+        out_text = original_text
+    sys.stdout.write(out_text)
+
+
+if __name__ == "__main__":
+    main()

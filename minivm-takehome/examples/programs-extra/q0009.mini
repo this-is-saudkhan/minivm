@@ -1,0 +1,46 @@
+; Average net line amount (price*qty*(1-disc), truncated to whole units),
+; remainder and line count, for lines of orders that are not "open",
+; restricted to products priced at least 0.01 (legacy data-quality guard
+; from before p_price had a NOT NULL + CHECK constraint -- now a no-op).
+; Exercises: DIV-family opcodes (IDIV, MOD), MUL/SUB/TRUNC, a duplicate dead
+; LOAD, and the same always-true-filter pattern as q0001 on a different
+; column/table (products.p_price's own CHECK+NOT_NULL constraint).
+LOAD l_order, lines.l_order
+LOAD l_prod, lines.l_prod
+LOAD l_qty, lines.l_qty
+LOAD l_price, lines.l_price
+LOAD l_disc, lines.l_disc
+LOAD unused_disc, lines.l_disc      ; dead: loaded again, never read
+LOAD p_id, products.p_id
+LOAD p_price, products.p_price
+GE price_ok, p_price, 0.01          ; always true: p_price NOT NULL, CHECK [0.01, 9999.99]
+IDX price_idx, price_ok
+GATHER p_id2, p_id, price_idx
+GATHER p_price2, p_price, price_idx
+HJOIN li, ri, l_prod, p_id2
+GATHER g_order, l_order, li
+GATHER g_qty, l_qty, li
+GATHER g_price, l_price, li
+GATHER g_disc, l_disc, li
+LOAD o_id, orders.o_id
+LOAD o_status, orders.o_status
+NULLIFE st, o_status
+RTRIM st2, st
+UPPER st3, st2
+NE open_filter, st3, 'OPEN'
+IDX open_idx, open_filter
+GATHER o_id2, o_id, open_idx
+HJOIN li2, ri2, g_order, o_id2
+GATHER f_qty, g_qty, li2
+GATHER f_price, g_price, li2
+GATHER f_disc, g_disc, li2
+SUB one_minus_disc, 1, f_disc
+MUL gross, f_price, f_qty
+MUL net, gross, one_minus_disc
+TRUNC net_i, net
+GALL grp, net_i
+GSUM total, grp, net_i
+GCOUNT n, grp
+IDIV avg_floor, total, n
+MOD remainder, total, n
+OUT avg_floor, remainder, n
