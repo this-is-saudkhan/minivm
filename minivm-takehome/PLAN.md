@@ -174,17 +174,42 @@ accidentally interacting badly with another one introduced later.
 
 ## AI model usage
 
-Built interactively in a single Claude Code session using **Claude Sonnet
-5** (`claude-sonnet-5`), the only model used. No subagents were spawned —
-all design, implementation, debugging, and this writeup were done directly
-in the main conversation. Token/spend figures for this session are
-available via Claude Code's `/cost` command (not something this document
-can report on its own behalf); the user should fill in the actual number
-before sending this. As a point of reference for the shape of the work:
-one long session, iterative — write a pass, run it against the real
-`bin/minivm` binary, hand-trace a wrong result back to its cause, fix, and
-re-verify. Three real bugs were found and fixed this way during
-development (documented in the `evaluate` commit message): a missing
-fact-propagation case, a fuzzer that couldn't reach deep join chains by
-chance, and a Windows-only subprocess limitation unrelated to the actual
-grading environment.
+Built interactively in a single Claude Code session, almost entirely with
+**Claude Sonnet 5** (`claude-sonnet-5`) — essentially 100% of the
+substantive work (design, implementation, debugging, documentation, this
+writeup) was done directly in the main conversation with this model; no
+subagents were spawned. Per Claude Code's own `/cost` output for this
+session:
+
+- **Total cost: $22.22**
+- Usage by model: `claude-sonnet-5` — 1.2k input tokens, 272.2k output
+  tokens, 72.9M cache-read tokens, 1.2M cache-write tokens (the $22.22
+  above); `claude-haiku-4-5` — 913 input / 19 output tokens (~$0.001,
+  incidental, not a deliberate second-model choice — Claude Code's own
+  tooling uses a small model for a couple of minor housekeeping calls
+  under the hood).
+- API duration: 56m 51s. Wall-clock duration: spread over multiple days
+  (the session was resumed across sittings rather than done in one
+  continuous block) — not a meaningful "hours spent" figure on its own,
+  since most of that elapsed time wasn't active work.
+- 3,183 lines added, 155 removed, across the whole session.
+
+The overwhelmingly cache-read-dominated token profile (98% of input
+tokens served from cache per `/cost`) reflects how the session actually
+ran: one long continuous conversation rather than many short fresh ones,
+so each new turn's context (the growing codebase, prior decisions, test
+output) was mostly already cached rather than re-sent from scratch.
+
+As a point of reference for the shape of the work: iterative throughout —
+write a pass, run it against the real `bin/minivm` binary, hand-trace a
+wrong or merely-unconvincing result back to its root cause, fix, and
+re-verify, rather than writing something once and assuming it's correct.
+Several real bugs were found and fixed this way during development
+(documented in the relevant commit messages): a missing fact-propagation
+case in `optimize`'s GATHER handling, a fuzzer that couldn't reach deep
+join chains by chance until literal-biasing and FK anchor-chaining were
+added, a Windows-only subprocess shebang-exec limitation (worked around,
+irrelevant to the actual POSIX grading environment), and a modeling
+mistake in one of the added example programs (q0011 initially joined on
+a unique key, which only ever matches a row to itself, producing an
+empty — but not wrong-looking — result until checked against intent).
